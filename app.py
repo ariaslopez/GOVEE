@@ -5,6 +5,10 @@ import sqlite3
 import requests
 from datetime import datetime, timedelta
 from flask import Flask, Response, render_template_string, request, g
+from dotenv import load_dotenv
+
+# ── Carga automática del .env (si existe) ───────────────────────────
+load_dotenv()
 
 GOVEE_API_KEY = os.getenv("GOVEE_API_KEY")
 BASE_URL      = "https://developer-api.govee.com/v1"
@@ -54,9 +58,10 @@ init_db()
 # GOVEE API HELPERS
 # ─────────────────────────────────────────────
 def govee_get(path, params=None):
-    if not GOVEE_API_KEY:
-        raise RuntimeError("Missing GOVEE_API_KEY environment variable")
-    headers = {"Govee-API-Key": GOVEE_API_KEY}
+    key = os.getenv("GOVEE_API_KEY")  # re-read en cada llamada por si cargó tarde
+    if not key:
+        raise RuntimeError("Missing GOVEE_API_KEY. Verifica tu archivo .env")
+    headers = {"Govee-API-Key": key}
     resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params or {})
     resp.raise_for_status()
     return resp.json()
@@ -91,7 +96,6 @@ def extract_sensor_data(raw_state):
     return temperature, humidity
 
 def fetch_and_store(gateway: str):
-    """Pull devices for the given gateway label, store readings in DB."""
     devices_resp = govee_get("/devices")
     raw_devices  = devices_resp.get("data", {}).get("devices", [])
     now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -103,19 +107,16 @@ def fetch_and_store(gateway: str):
         model = d.get("model", "")
         name  = d.get("deviceName", "Unnamed")
 
-        # skip devices that don't belong to this gateway
-        # (Govee API doesn't expose gateway natively — we tag by MAC prefix
-        #  or a custom mapping in GATEWAY_MAP env var: "GW1:A4:C1,GW2:B0:D2")
         gw_map = _parse_gateway_map()
         if gw_map and gateway != "all":
             prefix = gw_map.get(gateway, "")
             if prefix and not mac.startswith(prefix):
                 continue
 
-        state_resp          = govee_get("/devices", params={"device": mac, "model": model})
+        state_resp            = govee_get("/devices", params={"device": mac, "model": model})
         temperature, humidity = extract_sensor_data(state_resp)
-        props               = state_resp.get("data", {}).get("properties", [])
-        online              = int(state_resp.get("data", {}).get("online", False))
+        props                 = state_resp.get("data", {}).get("properties", [])
+        online                = int(state_resp.get("data", {}).get("online", False))
         power_state = brightness = None
         for prop in props:
             if "powerSwitch" in prop:
@@ -142,7 +143,6 @@ def fetch_and_store(gateway: str):
     return results
 
 def _parse_gateway_map():
-    """Parse GATEWAY_MAP env var: 'GW1:A4:C1,GW2:B0:D2' → {'GW1':'A4:C1','GW2':'B0:D2'}"""
     raw = os.getenv("GATEWAY_MAP", "")
     result = {}
     for entry in raw.split(","):
@@ -152,33 +152,27 @@ def _parse_gateway_map():
     return result
 
 def query_history(gateway, date_from, date_to, device_mac):
-    """Query stored readings with optional filters."""
     db     = get_db()
     sql    = "SELECT * FROM readings WHERE 1=1"
     params = []
-
     if gateway and gateway != "all":
         sql += " AND gateway = ?"
         params.append(gateway)
-
     if date_from:
         sql += " AND recorded_at >= ?"
         params.append(date_from + " 00:00:00")
-
     if date_to:
         sql += " AND recorded_at <= ?"
         params.append(date_to + " 23:59:59")
-
     if device_mac and device_mac != "all":
         sql += " AND device_mac = ?"
         params.append(device_mac)
-
     sql += " ORDER BY recorded_at DESC LIMIT 500"
     rows = db.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 def get_known_gateways():
-    db = get_db()
+    db   = get_db()
     rows = db.execute("SELECT DISTINCT gateway FROM readings ORDER BY gateway").fetchall()
     return [r["gateway"] for r in rows] or ["all"]
 
@@ -206,33 +200,26 @@ HTML_TEMPLATE = """
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Govee &mdash; Monitor de Dispositivos</title>
   <style>
-    :root {
-      --bg:#0f172a; --surface:#1e293b; --border:#334155;
-      --blue:#3b82f6; --cyan:#06b6d4; --orange:#f97316;
-      --green:#22c55e; --red:#ef4444; --yellow:#eab308;
-      --text:#f1f5f9; --muted:#94a3b8;
+    :root{
+      --bg:#0f172a;--surface:#1e293b;--border:#334155;
+      --blue:#3b82f6;--cyan:#06b6d4;--orange:#f97316;
+      --green:#22c55e;--red:#ef4444;--yellow:#eab308;
+      --text:#f1f5f9;--muted:#94a3b8;
     }
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
     body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;padding:2rem 1.5rem}
-    /* HEADER */
     header{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:1rem;
            margin-bottom:1.75rem;padding-bottom:1.25rem;border-bottom:1px solid var(--border)}
     header h1{font-size:1.4rem;font-weight:700;display:flex;align-items:center;gap:.5rem}
     .badge{font-size:.65rem;background:var(--blue);color:#fff;padding:.2rem .55rem;border-radius:999px;font-weight:700}
     .live-dot{width:8px;height:8px;border-radius:50%;background:var(--green);animation:pulse 2s infinite;display:inline-block}
     @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-    /* FILTER FORM */
-    .filter-bar{
-      background:var(--surface);border:1px solid var(--border);border-radius:14px;
-      padding:1.25rem 1.5rem;margin-bottom:1.75rem;
-      display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end;
-    }
+    .filter-bar{background:var(--surface);border:1px solid var(--border);border-radius:14px;
+      padding:1.25rem 1.5rem;margin-bottom:1.75rem;display:flex;flex-wrap:wrap;gap:1rem;align-items:flex-end}
     .field{display:flex;flex-direction:column;gap:.3rem;min-width:160px;flex:1}
     .field label{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);font-weight:600}
-    .field select,.field input{
-      background:var(--bg);color:var(--text);border:1px solid var(--border);
-      border-radius:8px;padding:.45rem .75rem;font-size:.85rem;outline:none;
-    }
+    .field select,.field input{background:var(--bg);color:var(--text);border:1px solid var(--border);
+      border-radius:8px;padding:.45rem .75rem;font-size:.85rem;outline:none}
     .field select:focus,.field input:focus{border-color:var(--blue)}
     .btn{display:inline-flex;align-items:center;gap:.35rem;padding:.5rem 1.1rem;
          border-radius:8px;font-size:.85rem;font-weight:600;text-decoration:none;
@@ -240,14 +227,12 @@ HTML_TEMPLATE = """
     .btn:hover{opacity:.82}
     .btn-primary{background:var(--blue);color:#fff}
     .btn-outline{background:transparent;color:var(--text);border:1px solid var(--border)}
-    .btn-sm{padding:.35rem .8rem;font-size:.78rem}
-    /* STATS */
     .stats{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:1rem;margin-bottom:1.75rem}
     .stat-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:1.1rem 1rem}
     .stat-label{font-size:.7rem;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin-bottom:.3rem}
     .stat-value{font-size:1.9rem;font-weight:800;line-height:1}
-    .c-blue{color:var(--blue)} .c-green{color:var(--green)} .c-yellow{color:var(--yellow)} .c-muted{color:var(--muted);font-size:.95rem;font-weight:500}
-    /* TABLE */
+    .c-blue{color:var(--blue)}.c-green{color:var(--green)}.c-yellow{color:var(--yellow)}
+    .c-muted{color:var(--muted);font-size:.95rem;font-weight:500}
     .table-wrap{overflow-x:auto;border:1px solid var(--border);border-radius:14px;margin-top:.5rem}
     table{border-collapse:collapse;width:100%;min-width:900px}
     thead{background:var(--surface)}
@@ -255,7 +240,6 @@ HTML_TEMPLATE = """
     th{color:var(--muted);font-size:.68rem;font-weight:700;text-transform:uppercase;letter-spacing:.07em}
     tr:last-child td{border-bottom:none}
     tr:hover td{background:rgba(255,255,255,.025)}
-    /* PILLS */
     .pill{display:inline-block;padding:.15rem .5rem;border-radius:999px;font-size:.7rem;font-weight:700}
     .p-online{background:rgba(34,197,94,.15);color:var(--green)}
     .p-offline{background:rgba(239,68,68,.15);color:var(--red)}
@@ -265,13 +249,14 @@ HTML_TEMPLATE = """
     .v-hum{color:var(--cyan);font-weight:700}
     .v-blue{color:var(--blue);font-weight:600}
     .na{color:var(--muted);font-style:italic}
-    /* ACTIONS ROW */
     .actions{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .footer-note{margin-top:1.5rem;font-size:.72rem;color:var(--muted);text-align:center}
+    /* ERROR BANNER */
+    .error-banner{background:rgba(239,68,68,.15);border:1px solid var(--red);color:var(--red);
+      border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.5rem;font-size:.85rem}
   </style>
 </head>
 <body>
-
 <header>
   <h1>&#127774; Govee Monitor <span class="badge">LIVE</span></h1>
   <span style="font-size:.8rem;color:var(--muted);display:flex;align-items:center;gap:.4rem">
@@ -279,7 +264,13 @@ HTML_TEMPLATE = """
   </span>
 </header>
 
-<!-- ── FILTER BAR ────────────────────────────── -->
+{% if error %}
+<div class="error-banner">
+  <strong>&#9888; Error al conectar con Govee API:</strong> {{ error }}
+  <br><small>Verifica que <code>GOVEE_API_KEY</code> est&eacute; definida en tu archivo <code>.env</code></small>
+</div>
+{% endif %}
+
 <form method="GET" action="/" class="filter-bar">
   <div class="field">
     <label>Gateway</label>
@@ -290,7 +281,6 @@ HTML_TEMPLATE = """
       {% endfor %}
     </select>
   </div>
-
   <div class="field">
     <label>Dispositivo</label>
     <select name="device_mac">
@@ -302,45 +292,26 @@ HTML_TEMPLATE = """
       {% endfor %}
     </select>
   </div>
-
   <div class="field">
     <label>Desde</label>
     <input type="date" name="date_from" value="{{ date_from }}">
   </div>
-
   <div class="field">
     <label>Hasta</label>
     <input type="date" name="date_to" value="{{ date_to }}">
   </div>
-
   <div style="display:flex;gap:.5rem;align-items:flex-end">
     <button type="submit" class="btn btn-primary">&#128269; Filtrar</button>
     <a href="/" class="btn btn-outline">&#10006; Limpiar</a>
   </div>
 </form>
 
-<!-- ── STATS CARDS ───────────────────────────── -->
 <div class="stats">
-  <div class="stat-card">
-    <div class="stat-label">Total mostrados</div>
-    <div class="stat-value c-blue">{{ devices|length }}</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">En l&iacute;nea</div>
-    <div class="stat-value c-green">{{ online_count }}</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Encendidos</div>
-    <div class="stat-value c-yellow">{{ power_on_count }}</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">Gateway activo</div>
-    <div class="stat-value c-muted">{{ selected_gateway }}</div>
-  </div>
-  <div class="stat-card">
-    <div class="stat-label">&Uacute;ltima actualizaci&oacute;n</div>
-    <div class="stat-value c-muted">{{ last_updated }}</div>
-  </div>
+  <div class="stat-card"><div class="stat-label">Total mostrados</div><div class="stat-value c-blue">{{ devices|length }}</div></div>
+  <div class="stat-card"><div class="stat-label">En l&iacute;nea</div><div class="stat-value c-green">{{ online_count }}</div></div>
+  <div class="stat-card"><div class="stat-label">Encendidos</div><div class="stat-value c-yellow">{{ power_on_count }}</div></div>
+  <div class="stat-card"><div class="stat-label">Gateway activo</div><div class="stat-value c-muted">{{ selected_gateway }}</div></div>
+  <div class="stat-card"><div class="stat-label">&Uacute;ltima actualizaci&oacute;n</div><div class="stat-value c-muted">{{ last_updated }}</div></div>
 </div>
 
 <p style="font-size:.82rem;color:var(--muted);margin-bottom:1rem">
@@ -350,30 +321,19 @@ HTML_TEMPLATE = """
   {% if date_to %} hasta <strong>{{ date_to }}</strong>{% endif %}
 </p>
 
-<!-- ── ACTIONS ───────────────────────────────── -->
 <div class="actions">
-  <a class="btn btn-primary" href="/download.csv?gateway={{ selected_gateway }}&date_from={{ date_from }}&date_to={{ date_to }}&device_mac={{ selected_device }}">
-    &#11015;&#65039; Descargar CSV
-  </a>
+  <a class="btn btn-primary" href="/download.csv?gateway={{ selected_gateway }}&date_from={{ date_from }}&date_to={{ date_to }}&device_mac={{ selected_device }}">&#11015;&#65039; Descargar CSV</a>
   <a class="btn btn-outline" href="/snapshot?gateway={{ selected_gateway }}">&#128247; Capturar ahora</a>
   <a class="btn btn-outline" href="/">&#128260; Actualizar</a>
 </div>
 
-<!-- ── TABLE ─────────────────────────────────── -->
 <div class="table-wrap">
   <table>
     <thead>
       <tr>
-        <th>Dispositivo</th>
-        <th>Modelo</th>
-        <th>MAC / ID</th>
-        <th>Gateway</th>
-        <th>Fecha/Hora</th>
-        <th>Online</th>
-        <th>Power</th>
-        <th>Brightness</th>
-        <th>Temperatura (&deg;C)</th>
-        <th>Humedad (%)</th>
+        <th>Dispositivo</th><th>Modelo</th><th>MAC / ID</th><th>Gateway</th>
+        <th>Fecha/Hora</th><th>Online</th><th>Power</th><th>Brightness</th>
+        <th>Temperatura (&deg;C)</th><th>Humedad (%)</th>
       </tr>
     </thead>
     <tbody>
@@ -384,29 +344,19 @@ HTML_TEMPLATE = """
         <td style="font-family:monospace;font-size:.76rem;color:var(--muted)">{{ device.device }}</td>
         <td><span class="pill" style="background:rgba(59,130,246,.15);color:var(--blue)">{{ device.gateway }}</span></td>
         <td style="font-size:.78rem;color:var(--muted)">{{ device.recorded_at }}</td>
-        <td>
-          {% if device.online %}<span class="pill p-online">&bull; Online</span>
-          {% else %}<span class="pill p-offline">&circ; Offline</span>{% endif %}
-        </td>
-        <td>
-          {% if device.power_state == 'on' %}<span class="pill p-on">&#9889; On</span>
-          {% elif device.power_state == 'off' %}<span class="pill p-off">Off</span>
-          {% else %}<span class="na">&mdash;</span>{% endif %}
-        </td>
-        <td>
-          {% if device.brightness is not none %}<span class="v-blue">{{ device.brightness }}%</span>
-          {% else %}<span class="na">&mdash;</span>{% endif %}
-        </td>
-        <td>
-          {% if device.temperature is not none %}
-            <span class="v-temp">{{ "%.2f"|format(device.temperature) }} &deg;C</span>
-          {% else %}<span class="na">No disponible</span>{% endif %}
-        </td>
-        <td>
-          {% if device.humidity is not none %}
-            <span class="v-hum">{{ "%.2f"|format(device.humidity) }} %</span>
-          {% else %}<span class="na">No disponible</span>{% endif %}
-        </td>
+        <td>{% if device.online %}<span class="pill p-online">&bull; Online</span>
+            {% else %}<span class="pill p-offline">&circ; Offline</span>{% endif %}</td>
+        <td>{% if device.power_state == 'on' %}<span class="pill p-on">&#9889; On</span>
+            {% elif device.power_state == 'off' %}<span class="pill p-off">Off</span>
+            {% else %}<span class="na">&mdash;</span>{% endif %}</td>
+        <td>{% if device.brightness is not none %}<span class="v-blue">{{ device.brightness }}%</span>
+            {% else %}<span class="na">&mdash;</span>{% endif %}</td>
+        <td>{% if device.temperature is not none %}
+              <span class="v-temp">{{ "%.2f"|format(device.temperature) }} &deg;C</span>
+            {% else %}<span class="na">No disponible</span>{% endif %}</td>
+        <td>{% if device.humidity is not none %}
+              <span class="v-hum">{{ "%.2f"|format(device.humidity) }} %</span>
+            {% else %}<span class="na">No disponible</span>{% endif %}</td>
       </tr>
       {% else %}
       <tr><td colspan="10" style="text-align:center;color:var(--muted);padding:2rem">Sin datos para los filtros seleccionados.</td></tr>
@@ -414,7 +364,6 @@ HTML_TEMPLATE = """
     </tbody>
   </table>
 </div>
-
 <p class="footer-note">Govee Monitor &mdash; Datos via Govee API</p>
 </body>
 </html>
@@ -425,20 +374,22 @@ HTML_TEMPLATE = """
 # ─────────────────────────────────────────────
 @app.route("/")
 def dashboard():
-    gateway      = request.args.get("gateway", "all")
-    device_mac   = request.args.get("device_mac", "all")
-    date_from    = request.args.get("date_from", "")
-    date_to      = request.args.get("date_to", "")
+    gateway    = request.args.get("gateway", "all")
+    device_mac = request.args.get("device_mac", "all")
+    date_from  = request.args.get("date_from", "")
+    date_to    = request.args.get("date_to", "")
+    error      = None
+    devices    = []
 
-    # If no history yet, fall back to live data
     rows = query_history(gateway, date_from, date_to, device_mac)
     if not rows:
-        live = fetch_and_store(gateway)
-        rows = [{**d, "gateway": gateway, "device": d["device"],
-                 "recorded_at": d["recorded_at"]} for d in live]
+        try:
+            live = fetch_and_store(gateway)
+            rows = [{**d, "gateway": gateway, "device": d["device"],
+                     "recorded_at": d["recorded_at"]} for d in live]
+        except Exception as e:
+            error = str(e)
 
-    # Normalize keys for template
-    devices = []
     for r in rows:
         devices.append({
             "name":        r.get("device_name") or r.get("name", ""),
@@ -455,24 +406,27 @@ def dashboard():
 
     return render_template_string(
         HTML_TEMPLATE,
-        devices        = devices,
-        online_count   = sum(1 for d in devices if d["online"]),
-        power_on_count = sum(1 for d in devices if d["power_state"] == "on"),
-        last_updated   = datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        gateways       = get_known_gateways(),
-        known_devices  = get_known_devices(gateway),
+        devices          = devices,
+        online_count     = sum(1 for d in devices if d["online"]),
+        power_on_count   = sum(1 for d in devices if d["power_state"] == "on"),
+        last_updated     = datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        gateways         = get_known_gateways(),
+        known_devices    = get_known_devices(gateway),
         selected_gateway = gateway,
         selected_device  = device_mac,
         date_from        = date_from,
         date_to          = date_to,
+        error            = error,
     )
 
 @app.route("/snapshot")
 def snapshot():
-    """Force a live pull and store; redirect back to dashboard."""
     from flask import redirect
     gateway = request.args.get("gateway", "all")
-    fetch_and_store(gateway)
+    try:
+        fetch_and_store(gateway)
+    except Exception:
+        pass
     return redirect(f"/?gateway={gateway}")
 
 @app.route("/download.csv")
@@ -481,23 +435,18 @@ def download_csv():
     device_mac = request.args.get("device_mac", "all")
     date_from  = request.args.get("date_from", "")
     date_to    = request.args.get("date_to", "")
-
-    rows   = query_history(gateway, date_from, date_to, device_mac)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["gateway", "device_name", "device_mac", "model",
-                     "recorded_at", "online", "power_state",
-                     "brightness", "temperature_c", "humidity_pct"])
+    rows       = query_history(gateway, date_from, date_to, device_mac)
+    output     = io.StringIO()
+    writer     = csv.writer(output)
+    writer.writerow(["gateway","device_name","device_mac","model",
+                     "recorded_at","online","power_state",
+                     "brightness","temperature_c","humidity_pct"])
     for r in rows:
         writer.writerow([
-            r.get("gateway", ""),
-            r.get("device_name", ""),
-            r.get("device_mac", ""),
-            r.get("model", ""),
-            r.get("recorded_at", ""),
+            r.get("gateway",""), r.get("device_name",""), r.get("device_mac",""),
+            r.get("model",""),   r.get("recorded_at",""),
             "online" if r.get("online") else "offline",
-            r.get("power_state") or "",
-            r.get("brightness")  or "",
+            r.get("power_state") or "", r.get("brightness") or "",
             f"{r['temperature']:.2f}" if r.get("temperature") is not None else "",
             f"{r['humidity']:.2f}"    if r.get("humidity")    is not None else "",
         ])
@@ -509,10 +458,12 @@ def download_csv():
 
 @app.route("/api/devices")
 def api_devices():
-    """JSON endpoint: current live devices for a gateway."""
     from flask import jsonify
     gateway = request.args.get("gateway", "all")
-    data    = fetch_and_store(gateway)
+    try:
+        data = fetch_and_store(gateway)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
     return jsonify({"gateway": gateway, "count": len(data), "devices": data})
 
 if __name__ == "__main__":
