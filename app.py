@@ -3,21 +3,19 @@ import io
 import csv
 import sqlite3
 import requests
-from datetime import datetime, timedelta
-from flask import Flask, Response, render_template_string, request, g
+from datetime import datetime
+from flask import Flask, Response, render_template_string, request, g, redirect, jsonify
 from dotenv import load_dotenv
 
-# ── Carga automática del .env (si existe) ───────────────────────────
 load_dotenv()
 
-GOVEE_API_KEY = os.getenv("GOVEE_API_KEY")
-BASE_URL      = "https://developer-api.govee.com/v1"
-DB_PATH       = os.getenv("DB_PATH", "govee_history.db")
+BASE_URL_V2 = "https://openapi.api.govee.com/router/api/v1"
+DB_PATH     = os.getenv("DB_PATH", "govee_history.db")
 
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# DATABASE  (historial de lecturas)
+# DATABASE
 # ─────────────────────────────────────────────
 def get_db():
     db = getattr(g, "_database", None)
@@ -55,92 +53,69 @@ def init_db():
 init_db()
 
 # ─────────────────────────────────────────────
-# GOVEE API HELPERS
+# GOVEE API v2 HELPERS
 # ─────────────────────────────────────────────
-def govee_get(path, params=None):
-    key = os.getenv("GOVEE_API_KEY")  # re-read en cada llamada por si cargó tarde
+def _headers():
+    key = os.getenv("GOVEE_API_KEY")
     if not key:
         raise RuntimeError("Missing GOVEE_API_KEY. Verifica tu archivo .env")
-    headers = {"Govee-API-Key": key}
-    resp = requests.get(f"{BASE_URL}{path}", headers=headers, params=params or {})
+    return {"Govee-API-Key": key, "Content-Type": "application/json"}
+
+def v2_get_devices():
+    """GET /router/api/v1/user/devices — lista todos los dispositivos."""
+    resp = requests.get(f"{BASE_URL_V2}/user/devices", headers=_headers(), timeout=15)
     resp.raise_for_status()
-    return resp.json()
+    return resp.json().get("data", [])
 
-def extract_sensor_data(raw_state):
-    temperature = humidity = None
-    try:
-        props = raw_state.get("data", {}).get("properties", [])
-        for prop in props:
-            if "temperature" in prop:
-                v = prop["temperature"]
+def v2_get_state(sku, device_id):
+    """POST /router/api/v1/device/state — estado actual del dispositivo."""
+    body = {"requestId": "govee-monitor", "payload": {"sku": sku, "device": device_id}}
+    resp = requests.post(f"{BASE_URL_V2}/device/state", headers=_headers(), json=body, timeout=15)
+    resp.raise_for_status()
+    return resp.json().get("payload", {})
+
+def extract_v2_state(capabilities):
+    """
+    Parsea la lista de capabilities del estado v2.
+    Retorna (online, power_state, brightness, temperature, humidity)
+    """
+    online      = False
+    power_state = None
+    brightness  = None
+    temperature = None
+    humidity    = None
+
+    for cap in capabilities:
+        t    = cap.get("type", "")
+        inst = cap.get("instance", "")
+        val  = cap.get("state", {}).get("value")
+
+        if t == "devices.capabilities.online":
+            online = bool(val)
+
+        elif t == "devices.capabilities.on_off" and inst == "powerSwitch":
+            power_state = "on" if val == 1 else "off"
+
+        elif t == "devices.capabilities.range" and inst == "brightness":
+            brightness = val
+
+        elif t == "devices.capabilities.property":
+            if inst == "sensorTemperature" and val is not None:
+                v = float(val)
                 temperature = v / 100 if v > 1000 else v
-            if "humidity" in prop:
-                v = prop["humidity"]
+            elif inst == "sensorHumidity" and val is not None:
+                v = float(val)
                 humidity = v / 100 if v > 1000 else v
-    except Exception:
-        pass
-    if temperature is None:
-        try:
-            v = raw_state.get("temperature") or raw_state.get("data", {}).get("temperature")
-            if v is not None:
-                temperature = v / 100 if v > 1000 else v
-        except Exception:
-            pass
-    if humidity is None:
-        try:
-            v = raw_state.get("humidity") or raw_state.get("data", {}).get("humidity")
-            if v is not None:
-                humidity = v / 100 if v > 1000 else v
-        except Exception:
-            pass
-    return temperature, humidity
 
-def fetch_and_store(gateway: str):
-    devices_resp = govee_get("/devices")
-    raw_devices  = devices_resp.get("data", {}).get("devices", [])
-    now          = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    db           = get_db()
-    results      = []
+        # fallback: algunos modelos usan instance directa
+        elif inst == "temperature" and val is not None and temperature is None:
+            v = float(val)
+            temperature = v / 100 if v > 1000 else v
+        elif inst == "humidity" and val is not None and humidity is None:
+            v = float(val)
+            humidity = v / 100 if v > 1000 else v
 
-    for d in raw_devices:
-        mac   = d.get("device", "")
-        model = d.get("model", "")
-        name  = d.get("deviceName", "Unnamed")
-
-        gw_map = _parse_gateway_map()
-        if gw_map and gateway != "all":
-            prefix = gw_map.get(gateway, "")
-            if prefix and not mac.startswith(prefix):
-                continue
-
-        state_resp            = govee_get("/devices", params={"device": mac, "model": model})
-        temperature, humidity = extract_sensor_data(state_resp)
-        props                 = state_resp.get("data", {}).get("properties", [])
-        online                = int(state_resp.get("data", {}).get("online", False))
-        power_state = brightness = None
-        for prop in props:
-            if "powerSwitch" in prop:
-                power_state = "on" if prop["powerSwitch"] == 1 else "off"
-            if "brightness" in prop:
-                brightness = prop["brightness"]
-
-        db.execute("""
-            INSERT INTO readings
-              (gateway, device_mac, device_name, model, online, power_state,
-               brightness, temperature, humidity, recorded_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (gateway, mac, name, model, online, power_state,
-               brightness, temperature, humidity, now))
-
-        results.append({
-            "name": name, "device": mac, "model": model,
-            "online": bool(online), "power_state": power_state,
-            "brightness": brightness, "temperature": temperature,
-            "humidity": humidity, "recorded_at": now,
-        })
-
-    db.commit()
-    return results
+    return online, power_state, brightness, temperature, humidity
 
 def _parse_gateway_map():
     raw = os.getenv("GATEWAY_MAP", "")
@@ -150,6 +125,50 @@ def _parse_gateway_map():
         if len(parts) == 2:
             result[parts[0].strip()] = parts[1].strip()
     return result
+
+def fetch_and_store(gateway: str):
+    raw_devices = v2_get_devices()
+    now         = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    db          = get_db()
+    results     = []
+    gw_map      = _parse_gateway_map()
+
+    for d in raw_devices:
+        device_id = d.get("device", "")
+        sku       = d.get("sku", "")
+        name      = d.get("deviceName", "Unnamed")
+
+        # Filtrar por gateway si está configurado
+        if gw_map and gateway != "all":
+            prefix = gw_map.get(gateway, "")
+            if prefix and not device_id.startswith(prefix):
+                continue
+
+        try:
+            state_payload = v2_get_state(sku, device_id)
+            capabilities  = state_payload.get("capabilities", [])
+            online, power_state, brightness, temperature, humidity = extract_v2_state(capabilities)
+        except Exception:
+            online = False
+            power_state = brightness = temperature = humidity = None
+
+        db.execute("""
+            INSERT INTO readings
+              (gateway, device_mac, device_name, model, online, power_state,
+               brightness, temperature, humidity, recorded_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (gateway, device_id, name, sku, int(online), power_state,
+               brightness, temperature, humidity, now))
+
+        results.append({
+            "name": name, "device": device_id, "model": sku,
+            "online": online, "power_state": power_state,
+            "brightness": brightness, "temperature": temperature,
+            "humidity": humidity, "recorded_at": now,
+        })
+
+    db.commit()
+    return results
 
 def query_history(gateway, date_from, date_to, device_mac):
     db     = get_db()
@@ -168,12 +187,10 @@ def query_history(gateway, date_from, date_to, device_mac):
         sql += " AND device_mac = ?"
         params.append(device_mac)
     sql += " ORDER BY recorded_at DESC LIMIT 500"
-    rows = db.execute(sql, params).fetchall()
-    return [dict(r) for r in rows]
+    return [dict(r) for r in db.execute(sql, params).fetchall()]
 
 def get_known_gateways():
-    db   = get_db()
-    rows = db.execute("SELECT DISTINCT gateway FROM readings ORDER BY gateway").fetchall()
+    rows = get_db().execute("SELECT DISTINCT gateway FROM readings ORDER BY gateway").fetchall()
     return [r["gateway"] for r in rows] or ["all"]
 
 def get_known_devices(gateway):
@@ -251,7 +268,6 @@ HTML_TEMPLATE = """
     .na{color:var(--muted);font-style:italic}
     .actions{display:flex;gap:.75rem;flex-wrap:wrap;margin-bottom:1rem}
     .footer-note{margin-top:1.5rem;font-size:.72rem;color:var(--muted);text-align:center}
-    /* ERROR BANNER */
     .error-banner{background:rgba(239,68,68,.15);border:1px solid var(--red);color:var(--red);
       border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.5rem;font-size:.85rem}
   </style>
@@ -266,7 +282,7 @@ HTML_TEMPLATE = """
 
 {% if error %}
 <div class="error-banner">
-  <strong>&#9888; Error al conectar con Govee API:</strong> {{ error }}
+  <strong>&#9888; Error al conectar con Govee API v2:</strong> {{ error }}
   <br><small>Verifica que <code>GOVEE_API_KEY</code> est&eacute; definida en tu archivo <code>.env</code></small>
 </div>
 {% endif %}
@@ -315,7 +331,7 @@ HTML_TEMPLATE = """
 </div>
 
 <p style="font-size:.82rem;color:var(--muted);margin-bottom:1rem">
-  Vista actual obtenida desde la API de Govee.
+  Datos en tiempo real via Govee API v2.
   {% if selected_gateway != 'all' %} &mdash; Gateway: <strong style="color:var(--blue)">{{ selected_gateway }}</strong>{% endif %}
   {% if date_from %} &mdash; Desde <strong>{{ date_from }}</strong>{% endif %}
   {% if date_to %} hasta <strong>{{ date_to }}</strong>{% endif %}
@@ -331,7 +347,7 @@ HTML_TEMPLATE = """
   <table>
     <thead>
       <tr>
-        <th>Dispositivo</th><th>Modelo</th><th>MAC / ID</th><th>Gateway</th>
+        <th>Dispositivo</th><th>Modelo / SKU</th><th>Device ID</th><th>Gateway</th>
         <th>Fecha/Hora</th><th>Online</th><th>Power</th><th>Brightness</th>
         <th>Temperatura (&deg;C)</th><th>Humedad (%)</th>
       </tr>
@@ -364,7 +380,7 @@ HTML_TEMPLATE = """
     </tbody>
   </table>
 </div>
-<p class="footer-note">Govee Monitor &mdash; Datos via Govee API</p>
+<p class="footer-note">Govee Monitor &mdash; API v2 &bull; openapi.api.govee.com</p>
 </body>
 </html>
 """
@@ -385,8 +401,7 @@ def dashboard():
     if not rows:
         try:
             live = fetch_and_store(gateway)
-            rows = [{**d, "gateway": gateway, "device": d["device"],
-                     "recorded_at": d["recorded_at"]} for d in live]
+            rows = [{**d, "gateway": gateway} for d in live]
         except Exception as e:
             error = str(e)
 
@@ -421,7 +436,6 @@ def dashboard():
 
 @app.route("/snapshot")
 def snapshot():
-    from flask import redirect
     gateway = request.args.get("gateway", "all")
     try:
         fetch_and_store(gateway)
@@ -458,7 +472,6 @@ def download_csv():
 
 @app.route("/api/devices")
 def api_devices():
-    from flask import jsonify
     gateway = request.args.get("gateway", "all")
     try:
         data = fetch_and_store(gateway)
